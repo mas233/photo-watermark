@@ -1,41 +1,39 @@
 #!/usr/bin/env python3
 """
-img_watermark.py
+img_watermark_stdin.py
 
-从 stdin 读取图片文件或目录路径（非递归），将 EXIF 拍摄日期写为水印并保存到原目录的 _watermark 子目录。
-
-改动：
-- 添加针对位图水印的抗锯齿处理（缩放后轻微平滑 + 反锐化）。
-- 右下角位置：距底部 = 画布高度 * 5%，距右侧 = 画布宽度 * 8%。
+交互脚本（基于你之前的版本，仅修改：颜色为 hex、字体接受百分比/像素/auto、位置五选一）。
+其它功能不变（TrueType 优先、位图回退渲染并缩放、抗锯齿、右下偏移按比率等）。
 """
 
 import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 
-# piexif 可选
+# piexif 可选（更稳健地读取 EXIF）
 try:
     import piexif
 except Exception:
     piexif = None
 
-# ---- 默认配置 ----
+# ---- 默认配置（未改动功能性参数，仅默认值） ----
 DEFAULT_COLOR_HEX = "#FFFFFF"
-DEFAULT_POS = "bottomright"  # topleft, topright, center, bottomleft, bottomright
-DEFAULT_PADDING = 12
+DEFAULT_POS = "bottomright"
 DEFAULT_JPEG_QUALITY = 95
 FALLBACK_TO_FILETIME = False
-MIN_FONT_SIZE = 12
-TARGET_WIDTH_RATIO = 0.10  # 文本目标占画布宽度的比例
+MIN_FONT_SIZE = 8
+DEFAULT_TARGET_RATIO = 0.10  # 默认 10%
+DEFAULT_PADDING = 12
 OUTLINE_WIDTH = 2
 OUTLINE_COLOR = (0, 0, 0, 200)
-# 右下偏移比例
-BOTTOM_OFFSET_RATIO = 0.05  # 底部空白 = 图片高度 * 5%
-RIGHT_OFFSET_RATIO = 0.08   # 右侧空白 = 图片宽度 * 8%
-# 抗锯齿器参数
+# 右下偏移比例（未改）
+BOTTOM_OFFSET_RATIO = 0.05
+RIGHT_OFFSET_RATIO = 0.08
+# 抗锯齿参数（未改）
 ANTIALIAS_BLUR_RADIUS = 0.6
 UNSHARP_RADIUS = 1
 UNSHARP_PERCENT = 120
@@ -43,21 +41,27 @@ UNSHARP_THRESHOLD = 3
 # -------------------
 
 
-def parse_hex_color(s):
+def parse_hex_color_to_rgba(s: str) -> Tuple[int, int, int, int]:
+    """解析 hex 字符串（#RRGGBB 或 RRGGBB 或 3位简写）为 RGBA 元组；出错抛异常。"""
+    if not s:
+        s = DEFAULT_COLOR_HEX
     s = s.strip()
     if s.startswith("#"):
         s = s[1:]
     if len(s) == 3:
-        s = ''.join([ch * 2 for ch in s])
+        s = ''.join([c * 2 for c in s])
     if len(s) != 6:
-        raise ValueError("颜色格式应为 RRGGBB 或 #RRGGBB")
-    r = int(s[0:2], 16)
-    g = int(s[2:4], 16)
-    b = int(s[4:6], 16)
+        raise ValueError("颜色格式应为 6 位十六进制，例如 #RRGGBB")
+    try:
+        r = int(s[0:2], 16)
+        g = int(s[2:4], 16)
+        b = int(s[4:6], 16)
+    except Exception:
+        raise ValueError("颜色包含非法十六进制字符")
     return (r, g, b, 255)
 
 
-def find_system_font():
+def find_system_font() -> Optional[str]:
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -70,7 +74,7 @@ def find_system_font():
     return None
 
 
-def _parse_exif_datetime(s):
+def _parse_exif_datetime(s: str) -> Optional[datetime]:
     if not s:
         return None
     if isinstance(s, bytes):
@@ -94,7 +98,7 @@ def _parse_exif_datetime(s):
     return None
 
 
-def read_exif_date(path):
+def read_exif_date(path: str) -> Optional[datetime]:
     try:
         if piexif:
             exif_dict = piexif.load(path)
@@ -117,7 +121,7 @@ def read_exif_date(path):
             img = Image.open(path)
             exif = img._getexif()
             if exif:
-                for tag in (36867, 306):  # DateTimeOriginal, DateTime
+                for tag in (36867, 306):
                     v = exif.get(tag)
                     if v:
                         return _parse_exif_datetime(v)
@@ -126,34 +130,25 @@ def read_exif_date(path):
     return None
 
 
-def ensure_rgba(img):
+def ensure_rgba(img: Image.Image) -> Image.Image:
     if img.mode != "RGBA":
         return img.convert("RGBA")
     return img
 
 
-def draw_text_with_outline_on_draw(draw, xy, text, font, fill, outline_fill=OUTLINE_COLOR, outline_width=OUTLINE_WIDTH):
+def draw_text_with_outline_on_draw(draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str, font: ImageFont.ImageFont,
+                                  fill: Tuple[int, int, int, int], outline_fill=OUTLINE_COLOR, outline_width=OUTLINE_WIDTH):
     x, y = xy
-    # draw outline
     for ox in range(-outline_width, outline_width + 1):
         for oy in range(-outline_width, outline_width + 1):
             if ox == 0 and oy == 0:
                 continue
             draw.text((x + ox, y + oy), text, font=font, fill=outline_fill)
-    # main text
     draw.text((x, y), text, font=font, fill=fill)
 
 
-def is_image_file(path):
-    ext = str(path).lower()
-    return ext.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"))
-
-
-def render_text_to_image(text, font, outline_width=OUTLINE_WIDTH, fill=(255, 255, 255, 255), outline_fill=OUTLINE_COLOR):
-    """
-    在内存中创建一个紧包围文本的透明 PNG，包含描边，返回 PIL.Image RGBA。
-    font 可以是任何 ImageFont（位图或 truetype）。
-    """
+def render_text_to_image(text: str, font: ImageFont.ImageFont,
+                         outline_width=OUTLINE_WIDTH, fill=(255, 255, 255, 255), outline_fill=OUTLINE_COLOR) -> Image.Image:
     tmp = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
     draw_tmp = ImageDraw.Draw(tmp)
     try:
@@ -163,24 +158,16 @@ def render_text_to_image(text, font, outline_width=OUTLINE_WIDTH, fill=(255, 255
         bbox = (0, 0, w, h)
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
-
     pad = outline_width + 2
     canvas_w = tw + pad * 2
     canvas_h = th + pad * 2
-
     img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw_text_with_outline_on_draw(draw, (pad, pad), text, font=font, fill=fill, outline_fill=outline_fill, outline_width=outline_width)
     return img
 
 
-def scale_image_to_width_antialiased(img, target_w):
-    """
-    缩放并做抗锯齿处理：
-    - 使用高质量重采样 LANCZOS
-    - 对结果做轻微高斯模糊以平滑锯齿
-    - 再做 UnsharpMask 以保留边缘清晰度（综合平滑与清晰）
-    """
+def scale_image_to_width_antialiased(img: Image.Image, target_w: int) -> Image.Image:
     if img.width == 0:
         return img
     scale = target_w / img.width
@@ -189,16 +176,115 @@ def scale_image_to_width_antialiased(img, target_w):
     new_w = max(1, int(round(img.width * scale)))
     new_h = max(1, int(round(img.height * scale)))
     resized = img.resize((new_w, new_h), resample=Image.LANCZOS)
-    # 轻微平滑
     if ANTIALIAS_BLUR_RADIUS > 0:
         resized = resized.filter(ImageFilter.GaussianBlur(radius=ANTIALIAS_BLUR_RADIUS))
-    # 反锐化以恢复边缘（参数可调）
     resized = resized.filter(ImageFilter.UnsharpMask(radius=UNSHARP_RADIUS, percent=UNSHARP_PERCENT, threshold=UNSHARP_THRESHOLD))
     return resized
 
 
-def process_image(path, outdir, color=(255, 255, 255, 255), pos=DEFAULT_POS, padding=DEFAULT_PADDING,
-                  quality=DEFAULT_JPEG_QUALITY, fallback_to_filetime=FALLBACK_TO_FILETIME):
+def scale_image_to_height_antialiased(img: Image.Image, target_h: int) -> Image.Image:
+    if img.height == 0:
+        return img
+    scale = target_h / img.height
+    if scale <= 0:
+        return img
+    new_w = max(1, int(round(img.width * scale)))
+    new_h = max(1, int(round(img.height * scale)))
+    resized = img.resize((new_w, new_h), resample=Image.LANCZOS)
+    if ANTIALIAS_BLUR_RADIUS > 0:
+        resized = resized.filter(ImageFilter.GaussianBlur(radius=ANTIALIAS_BLUR_RADIUS))
+    resized = resized.filter(ImageFilter.UnsharpMask(radius=UNSHARP_RADIUS, percent=UNSHARP_PERCENT, threshold=UNSHARP_THRESHOLD))
+    return resized
+
+
+def load_truetype_candidate() -> Optional[str]:
+    try:
+        ImageFont.truetype("DejaVuSans.ttf", 20)
+        return "DejaVuSans.ttf"
+    except Exception:
+        sysfont = find_system_font()
+        if sysfont:
+            try:
+                ImageFont.truetype(sysfont, 20)
+                return sysfont
+            except Exception:
+                return None
+    return None
+
+
+def is_image_file(path: str) -> bool:
+    ext = str(path).lower()
+    return ext.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"))
+
+
+# ---------- 新增：解析颜色/字体/位置输入（只这部分是改动） ----------
+def parse_color_input(s: str) -> Tuple[int, int, int, int]:
+    s = (s or "").strip()
+    if not s:
+        return parse_hex_color_to_rgba(DEFAULT_COLOR_HEX)
+    try:
+        return parse_hex_color_to_rgba(s)
+    except Exception as e:
+        print(f"[警告] 颜色解析失败 ({e})，使用默认 {DEFAULT_COLOR_HEX}")
+        return parse_hex_color_to_rgba(DEFAULT_COLOR_HEX)
+
+
+def parse_font_input(s: str) -> Tuple[str, float, Optional[int]]:
+    """
+    解析字体输入，返回 (mode, ratio, pixels)
+    mode: 'auto' 或 'ratio' 或 'pixels'
+    ratio: 用于 ratio 模式（0.08 表示 8%）
+    pixels: 用于 pixels 模式（整数像素高度）
+    支持输入示例： "" / "auto" -> ('auto', DEFAULT_TARGET_RATIO, None)
+                     "8%" or "8" -> ('ratio', 0.08, None)
+                     "24px" or "24" -> ('pixels', None, 24)
+    """
+    raw = (s or "").strip().lower()
+    if raw == "" or raw == "auto":
+        return "auto", DEFAULT_TARGET_RATIO, None
+    # 如果包含 '%' 视为百分比
+    if raw.endswith("%"):
+        try:
+            num = float(raw[:-1])
+            return "ratio", max(0.001, min(1.0, num / 100.0)), None
+        except Exception:
+            return "auto", DEFAULT_TARGET_RATIO, None
+    # 如果包含 'px' 或仅为整数 -> pixels
+    if raw.endswith("px"):
+        try:
+            px = int(raw[:-2])
+            return "pixels", None, max(1, px)
+        except Exception:
+            return "auto", DEFAULT_TARGET_RATIO, None
+    # 若是纯数字，按两种解释：
+    # - 若数字 <= 100 则视为百分比（兼容用户输入 "8" 意为 8%）
+    # - 若数字 > 100 视为像素
+    try:
+        num = float(raw)
+        if num <= 100:
+            return "ratio", max(0.001, min(1.0, num / 100.0)), None
+        else:
+            return "pixels", None, max(1, int(num))
+    except Exception:
+        return "auto", DEFAULT_TARGET_RATIO, None
+
+
+def parse_position_input(s: str) -> str:
+    raw = (s or "").strip().lower()
+    mapping = {
+        "top-left": "topleft", "top_left": "topleft", "topleft": "topleft",
+        "top-right": "topright", "top_right": "topright", "topright": "topright",
+        "center": "center",
+        "bottom-left": "bottomleft", "bottom_left": "bottomleft", "bottomleft": "bottomleft",
+        "bottom-right": "bottomright", "bottom_right": "bottomright", "bottomright": "bottomright",
+    }
+    return mapping.get(raw, DEFAULT_POS)
+# -------------------------------------------------------------------
+
+
+def process_image(path: str, outdir: str, color: Tuple[int, int, int, int],
+                  pos: str, font_input_mode: str, font_ratio: Optional[float], font_pixels: Optional[int],
+                  quality: int = DEFAULT_JPEG_QUALITY, fallback_to_filetime: bool = FALLBACK_TO_FILETIME):
     path = Path(path)
     try:
         img = Image.open(path)
@@ -221,41 +307,42 @@ def process_image(path, outdir, color=(255, 255, 255, 255), pos=DEFAULT_POS, pad
 
     text = dt.strftime("%Y-%m-%d")
     img_w, img_h = img.size
-    target_w = max(1, int(round(img_w * TARGET_WIDTH_RATIO)))
 
-    # 尝试加载可缩放的 TrueType 字体
-    truetype_candidate = None
-    try:
-        ImageFont.truetype("DejaVuSans.ttf", 20)
-        truetype_candidate = "DejaVuSans.ttf"
-    except Exception:
-        sysfont = find_system_font()
-        if sysfont:
-            try:
-                ImageFont.truetype(sysfont, 20)
-                truetype_candidate = sysfont
-            except Exception:
-                truetype_candidate = None
+    # 计算 target 宽/高（由 font_input_mode 决定）
+    target_w = None
+    target_h = None
+    if font_input_mode in ("auto", "ratio"):
+        ratio = font_ratio if font_ratio is not None else DEFAULT_TARGET_RATIO
+        target_w = max(1, int(round(img_w * ratio)))
+    elif font_input_mode == "pixels":
+        target_h = max(1, int(font_pixels)) if font_pixels is not None else None
 
+    # 尝试 TrueType 字体
+    truetype_candidate = load_truetype_candidate()
     rgba = ensure_rgba(img)
     draw = ImageDraw.Draw(rgba)
 
     if truetype_candidate:
-        # 直接按目标宽度来计算合适的字体大小
-        size_guess = max(MIN_FONT_SIZE, int(img_w * TARGET_WIDTH_RATIO))
-        font = ImageFont.truetype(truetype_candidate, size_guess)
-        try:
-            bbox = draw.textbbox((0, 0), text, font=font)
-            tw = bbox[2] - bbox[0]
-        except Exception:
-            tw, _ = draw.textsize(text, font=font)
-        if tw == 0:
-            final_font = font
-        else:
-            scale = target_w / tw
-            final_size = max(MIN_FONT_SIZE, int(round(size_guess * scale)))
+        # 使用 TrueType：对 ratio 模式我们按目标宽度调整字体大小；对 pixels 模式直接用像素大小
+        if font_input_mode in ("auto", "ratio"):
+            guess_size = max(MIN_FONT_SIZE, int(img_w * (font_ratio if font_ratio is not None else DEFAULT_TARGET_RATIO)))
+            font = ImageFont.truetype(truetype_candidate, guess_size)
+            try:
+                bbox = draw.textbbox((0, 0), text, font=font)
+                tw = bbox[2] - bbox[0]
+            except Exception:
+                tw, _ = draw.textsize(text, font=font)
+            if tw <= 0:
+                final_font = font
+            else:
+                scale = (target_w / tw) if tw > 0 else 1.0
+                final_size = max(MIN_FONT_SIZE, int(round(guess_size * scale)))
+                final_font = ImageFont.truetype(truetype_candidate, final_size)
+        else:  # pixels 模式
+            final_size = max(MIN_FONT_SIZE, font_pixels or MIN_FONT_SIZE)
             final_font = ImageFont.truetype(truetype_candidate, final_size)
-        # measure final
+
+        # 测量最终尺寸
         try:
             bbox = draw.textbbox((0, 0), text, font=final_font)
             tw = bbox[2] - bbox[0]
@@ -263,36 +350,36 @@ def process_image(path, outdir, color=(255, 255, 255, 255), pos=DEFAULT_POS, pad
         except Exception:
             tw, th = draw.textsize(text, font=final_font)
 
-        # compute position; special-case bottomright using % 偏移
+        # 位置计算（bottomright 使用比例偏移）
         if pos == "topleft":
-            x = padding
-            y = padding
+            x = DEFAULT_PADDING
+            y = DEFAULT_PADDING
         elif pos == "topright":
-            x = img_w - tw - padding
-            y = padding
+            x = img_w - tw - DEFAULT_PADDING
+            y = DEFAULT_PADDING
         elif pos == "center":
             x = (img_w - tw) // 2
             y = (img_h - th) // 2
         elif pos == "bottomleft":
-            x = padding
-            y = img_h - th - padding
-        else:  # bottomright: use % 偏移
+            x = DEFAULT_PADDING
+            y = img_h - th - DEFAULT_PADDING
+        else:  # bottomright
             right_offset = int(round(img_w * RIGHT_OFFSET_RATIO))
             bottom_offset = int(round(img_h * BOTTOM_OFFSET_RATIO))
             x = img_w - tw - right_offset
             y = img_h - th - bottom_offset
             if x < 0:
-                x = max(0, img_w - tw - padding)
+                x = max(0, img_w - tw - DEFAULT_PADDING)
             if y < 0:
-                y = max(0, img_h - th - padding)
+                y = max(0, img_h - th - DEFAULT_PADDING)
 
-        # Draw with outline
+        # 绘制（带描边）
         try:
             draw_text_with_outline_on_draw(draw, (x, y), text, font=final_font, fill=color, outline_fill=OUTLINE_COLOR, outline_width=OUTLINE_WIDTH)
         except Exception:
             draw.text((x, y), text, font=final_font, fill=color)
 
-        # save
+        # 保存
         os.makedirs(outdir, exist_ok=True)
         outpath = Path(outdir) / path.name
         ext = path.suffix.lower()
@@ -311,19 +398,26 @@ def process_image(path, outdir, color=(255, 255, 255, 255), pos=DEFAULT_POS, pad
             print(f"[错误] 保存失败：{outpath} -> {e}")
             return
 
-        print(f"[已保存] {outpath} （文本：{text}，TrueType 字体，文本宽度：{tw}px，画布宽度：{img_w}px）")
+        print(f"[已保存] {outpath} （TrueType, 宽={tw}px, 高={th}px, 画布宽={img_w}px）")
         return
 
-    # 如果没有 TrueType 字体：渲染位图水印并缩放 + 抗锯齿处理后叠加
-    print("[警告] 未找到可用的 TrueType 字体，将渲染位图水印并通过抗锯齿缩放获得目标大小。")
+    # 无 TrueType：位图渲染并按目标尺寸缩放抗锯齿（保持原行为）
+    print("[警告] 未找到 TrueType 字体，使用位图渲染并缩放（抗锯齿）。")
     default_font = ImageFont.load_default()
     wm = render_text_to_image(text, default_font, outline_width=OUTLINE_WIDTH, fill=color, outline_fill=OUTLINE_COLOR)
-    # supersample-ish antialias via our function
-    wm_scaled = scale_image_to_width_antialiased(wm, target_w)
+
+    # 选择缩放目标：优先 target_w（ratio/auto），否则 target_h（pixels）
+    if target_w is not None:
+        wm_scaled = scale_image_to_width_antialiased(wm, target_w)
+    elif target_h is not None:
+        wm_scaled = scale_image_to_height_antialiased(wm, target_h)
+    else:
+        wm_scaled = wm  # fallback
+
     tw = wm_scaled.width
     th = wm_scaled.height
 
-    # compute position; special-case bottomright using % 偏移
+    # 位置（bottomright 使用比例偏移）
     if pos == "topleft":
         x = DEFAULT_PADDING
         y = DEFAULT_PADDING
@@ -336,7 +430,7 @@ def process_image(path, outdir, color=(255, 255, 255, 255), pos=DEFAULT_POS, pad
     elif pos == "bottomleft":
         x = DEFAULT_PADDING
         y = img_h - th - DEFAULT_PADDING
-    else:  # bottomright with % 偏移
+    else:  # bottomright
         right_offset = int(round(img_w * RIGHT_OFFSET_RATIO))
         bottom_offset = int(round(img_h * BOTTOM_OFFSET_RATIO))
         x = img_w - tw - right_offset
@@ -348,7 +442,7 @@ def process_image(path, outdir, color=(255, 255, 255, 255), pos=DEFAULT_POS, pad
 
     rgba.paste(wm_scaled, (x, y), wm_scaled)
 
-    # save
+    # 保存
     os.makedirs(outdir, exist_ok=True)
     outpath = Path(outdir) / path.name
     ext = path.suffix.lower()
@@ -367,7 +461,7 @@ def process_image(path, outdir, color=(255, 255, 255, 255), pos=DEFAULT_POS, pad
         print(f"[错误] 保存失败：{outpath} -> {e}")
         return
 
-    print(f"[已保存] {outpath} （文本：{text}，位图缩放后宽度：{tw}px，画布宽度：{img_w}px）")
+    print(f"[已保存] {outpath} （位图缩放后 宽={tw}px, 高={th}px, 画布宽={img_w}px）")
 
 
 def main():
@@ -402,20 +496,44 @@ def main():
         print("未找到要处理的图片，退出。")
         sys.exit(0)
 
+    print(f"找到 {len(targets)} 张图片。")
+
+    # 三次独立提示（按你的要求）
+    # 1) 颜色（hex）
+    try:
+        color_input = input(f"请输入文字颜色（hex，例如 #FFFFFF，回车=默认 {DEFAULT_COLOR_HEX}）: ").strip()
+    except EOFError:
+        color_input = ""
+    color = parse_color_input(color_input)
+
+    # 2) 字体大小（auto / <percent>% / <pixels>）
+    try:
+        font_input = input("请输入字体大小（auto / <percent>% / <pixels>，回车=auto）: ").strip()
+    except EOFError:
+        font_input = ""
+    mode, ratio, px = parse_font_input(font_input)
+
+    # 3) 位置（五选一）
+    try:
+        pos_input = input(f"请输入水印位置（topleft/topright/center/bottomleft/bottomright，回车={DEFAULT_POS}）: ").strip()
+    except EOFError:
+        pos_input = ""
+    pos = parse_position_input(pos_input)
+
+    # 输出目录
     if p.is_dir():
         outdir = p / "_watermark"
     else:
         outdir = p.parent / "_watermark"
 
-    # 解析默认颜色
-    try:
-        color = parse_hex_color(DEFAULT_COLOR_HEX)
-    except Exception:
-        color = (255, 255, 255, 255)
+    print("开始处理图片...")
 
     for t in targets:
-        process_image(str(t), str(outdir), color=color, pos=DEFAULT_POS, padding=DEFAULT_PADDING,
+        process_image(str(t), str(outdir), color=color, pos=pos,
+                      font_input_mode=mode, font_ratio=ratio, font_pixels=px,
                       quality=DEFAULT_JPEG_QUALITY, fallback_to_filetime=FALLBACK_TO_FILETIME)
+
+    print("全部处理完成。输出目录：", outdir)
 
 
 if __name__ == "__main__":
